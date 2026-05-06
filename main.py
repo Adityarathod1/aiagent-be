@@ -5,7 +5,12 @@ from videosdk.plugins.google import GeminiRealtime, GeminiLiveConfig
 from dotenv import load_dotenv
 import os
 import logging
+import json
+import asyncpg
+import google.generativeai as genai
+
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -45,9 +50,9 @@ class MyVoiceAgent(Agent):
         await self.session.say("Hello! This is the Government Services Department. How can I help you today?")
 
     async def on_exit(self) -> None:
-        print("\n" + "="*30)
-        print("CONVERSATION LOG (FINAL)")
-        print("="*30)
+        logger.info("\n" + "="*30)
+        logger.info("CONVERSATION LOG (FINAL)")
+        logger.info("="*30)
         full_log = []
         for msg in self.chat_context.messages():
             role = msg.role.value.upper()
@@ -55,22 +60,23 @@ class MyVoiceAgent(Agent):
             content = msg.content if isinstance(msg.content, str) else " ".join([str(c) for c in msg.content])
             if role != "SYSTEM": # We usually don't need to log the system instructions
                 full_log.append(f"{role}: {content}")
-                print(f"{role}: {content}")
-        print("="*30 + "\n")
+                logger.info(f"{role}: {content}")
+        logger.info("="*30 + "\n")
 
         # Save to PostgreSQL
         try:
-            import asyncpg
-            import google.generativeai as genai
-            import json
-            
-            print("💾 Saving complaint to PostgreSQL...")
+            logger.info("💾 Saving complaint to PostgreSQL...")
             
             log_text = "\n".join(full_log)
-            
+            if not log_text.strip():
+                logger.info("⚠️ Log is empty, skipping DB save.")
+                return
+
             # Use Gemini to extract structured info
             genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-            extraction_model = genai.GenerativeModel('gemini-2.5-flash')
+            # Use a stable model for extraction
+            extraction_model = genai.GenerativeModel('gemini-1.5-flash')
+            
             prompt = f"""
             Extract the following details from this conversation log and return ONLY a valid JSON object without markdown formatting.
             {{
@@ -86,16 +92,27 @@ class MyVoiceAgent(Agent):
             """
             
             try:
-                response = extraction_model.generate_content(prompt)
-                raw_json = response.text.strip().removeprefix('```json').removesuffix('```').strip()
-                extracted_data = json.loads(raw_json)
+                logger.info("🧠 Extracting information with Gemini...")
+                # Use async version to avoid blocking
+                response = await extraction_model.generate_content_async(prompt)
+                text = response.text.strip()
+                
+                # Robust JSON extraction
+                json_text = text
+                if "```json" in text:
+                    json_text = text.split("```json")[1].split("```")[0].strip()
+                elif "```" in text:
+                    json_text = text.split("```")[1].split("```")[0].strip()
+                
+                extracted_data = json.loads(json_text)
                 summary = extracted_data.get('summary', 'Voice Complaint Log')
                 department = extracted_data.get('department', 'General')
                 priority = extracted_data.get('priority', 'MEDIUM')
                 complainant_name = extracted_data.get('complainant_name', 'Unknown')
                 location = extracted_data.get('location', 'Unknown')
+                logger.info(f"📋 Extracted: {summary} ({department})")
             except Exception as e:
-                print(f"⚠️ Failed to parse AI extraction: {e}")
+                logger.warning(f"⚠️ Failed to parse AI extraction: {e}")
                 # Fallback
                 agent_msgs = [msg for msg in full_log if msg.startswith("AGENT:")]
                 summary = agent_msgs[-1].replace("AGENT: ", "") if agent_msgs else "Voice Complaint Log"
@@ -104,17 +121,31 @@ class MyVoiceAgent(Agent):
                 complainant_name = "Unknown"
                 location = "Unknown"
 
-            # We connect to the local 'callvoicebot' database
-            conn = await asyncpg.connect(user='aditya', database='callvoicebot')
-            
-            await conn.execute(
-                "INSERT INTO complaints (summary, full_log, department, priority, complainant_name, location) VALUES ($1, $2, $3, $4, $5, $6)", 
-                summary, log_text, department, priority, complainant_name, location
+            logger.info(f"🔌 Connecting to database...")
+            # Use environment variables for connection
+            conn = await asyncpg.connect(
+                user=os.getenv("DB_USER"),
+                password=os.getenv("DB_PASSWORD"),
+                database=os.getenv("DB_NAME"),
+                host=os.getenv("DB_HOST"),
+                port=os.getenv("DB_PORT"),
+                timeout=10
             )
-            await conn.close()
-            print("✅ Complaint saved to PostgreSQL successfully.")
+            
+            try:
+                logger.info(f"📝 Executing INSERT...")
+                await conn.execute(
+                    "INSERT INTO complaints (summary, full_log, department, priority, complainant_name, location) VALUES ($1, $2, $3, $4, $5, $6)", 
+                    summary, log_text, department, priority, complainant_name, location
+                )
+                logger.info("✅ Complaint saved to PostgreSQL successfully.")
+            finally:
+                await conn.close()
+                logger.info("🔌 Database connection closed.")
+                
         except Exception as e:
-            print(f"❌ Failed to save complaint to PostgreSQL: {e}")
+            logger.error(f"❌ Failed to save complaint to PostgreSQL: {e}")
+            traceback.print_exc()
 
 async def start_session(context: JobContext):
     # Configure the Gemini model for real-time voice
